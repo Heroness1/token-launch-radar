@@ -3,79 +3,75 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Launch Radar — what pre-token protocols would be worth</title>
+<title>Token Launch Radar</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<header class="wrap">
-  <p class="kicker">Token Launch Radar</p>
-  <h1>What would it be worth if it launched?</h1>
-  <p class="lede">198 protocols that record no token, ranked by the implied value of the token they
-  would have if launched — from their own TVL, 7-day growth and age, priced off launched
-  protocols in the same category. Every row carries a concrete farm plan.</p>
-  <p class="meta" id="meta">Loading…</p>
+<header class="top">
+  <div>
+    <h1>Token Launch Radar</h1>
+    <p class="sub">Pre-token protocols, ranked by what their token would be worth <b>if it launches</b>. Fitted on the protocols whose tokens already trade — no hardcoded names.</p>
+    <p class="meta" id="metaLine"></p>
+  </div>
+  <div class="kpis" id="kpis"></div>
 </header>
 
-<main class="wrap">
-  <section class="controls" aria-label="Filter and sort">
-    <label>Search <input id="q" type="search" placeholder="Name or slug…" autocomplete="off"></label>
-    <label>Category <select id="cat"></select></label>
-    <label>Chain <select id="chain"></select></label>
-    <label>Size <select id="size">
-      <option value="">Any TVL</option>
-      <option value="huge">≥ $1B</option>
-      <option value="big">$250M – $1B</option>
-      <option value="mid">$50M – $250M</option>
-      <option value="small">&lt; $50M</option>
-    </select></label>
-    <label>Confidence <select id="conf">
-      <option value="">Any</option><option value="2">High</option>
-      <option value="1">Medium</option><option value="0">Low</option>
-    </select></label>
-    <label>Sort <select id="sort">
-      <option value="rank">Rank (implied value)</option>
-      <option value="tvl">TVL</option>
-      <option value="growth">7-day growth</option>
-      <option value="age">Age</option>
-      <option value="name">Name</option>
-    </select></label>
+<main>
+  <section class="card" id="ledgerCard">
+    <h2>Coverage ledger — every protocol in the snapshot, exactly once</h2>
+    <p class="note">A protocol is “already tokened” when <i>any</i> of its token fields (gecko id, symbol, market cap) says so. The snapshot’s fields disagree for 272 protocols — a gecko id and symbol, but no market cap — and those count as tokened, the conservative reading. “Records no token” is a record, never proof a protocol has none.</p>
+    <div class="ledger" id="ledger"></div>
+    <div class="excluded" id="excluded"></div>
   </section>
 
-  <section id="detail" class="detail" hidden></section>
+  <section class="card" id="modelCard">
+    <h2>How the value is made — and how wrong it usually is</h2>
+    <div id="model"></div>
+  </section>
 
-  <p class="count" id="count"></p>
-  <div class="tablewrap">
-    <table id="board">
-      <thead><tr>
-        <th class="num">#</th><th>Protocol</th><th>Category</th><th>Chains</th>
-        <th class="num">TVL</th><th class="num">7-day</th><th class="num">Age</th>
-        <th class="num">Implied value</th><th>Confidence</th>
-      </tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-  </div>
-  <p class="empty" id="empty" hidden>No protocol matches these filters. Clear the search or widen a filter.</p>
+  <section class="card" id="paramsCard">
+    <h2>Farm assumptions — one table, everything the verdicts rest on</h2>
+    <p class="note">These are assumptions, not snapshot facts. Change one and the verdicts move; the table is here so a reader can see exactly what they are.</p>
+    <div id="params"></div>
+  </section>
+
+  <section class="card">
+    <h2>The board</h2>
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search name, chain or category" aria-label="Search">
+      <select id="fCat" aria-label="Category"><option value="">All categories</option></select>
+      <select id="fChain" aria-label="Chain"><option value="">All chains</option></select>
+      <select id="fVerdict" aria-label="Verdict">
+        <option value="">All verdicts</option><option>FARM</option><option>MARGINAL</option><option>SKIP</option>
+      </select>
+      <button id="reset" type="button">Reset</button>
+      <span class="count" id="count"></span>
+    </div>
+    <div class="tablewrap">
+      <table id="board">
+        <thead><tr>
+          <th data-k="rank">#</th><th data-k="name">Protocol</th><th data-k="category">Category</th>
+          <th data-k="chain">Chain</th><th data-k="tvl">TVL</th><th data-k="chg">7D</th>
+          <th data-k="odds">Token odds</th>
+          <th data-k="value">Value if it launches</th><th data-k="verdict">Verdict</th>
+          <th data-k="net">Net</th><th data-k="perHr">$/hour</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p class="note">Click a row for the full derivation, the farm plan and the peers. Value is the headline: what the token would be worth if it launches. Token odds feed only the farm decision, never the ranking.</p>
+  </section>
+
+  <section class="card" id="detailCard" hidden>
+    <button id="back" type="button">← Back to the board</button>
+    <div id="detail"></div>
+  </section>
 </main>
 
-<footer class="wrap">
-  <h2>How the value is worked out</h2>
-  <p>Implied value = TVL × the median market-cap-to-TVL ratio of launched protocols in the
-  same category. Ratios are winsorized to the 5th/90th percentile of all launched ratios, then
-  shrunk toward the global median when a category has few launched peers, so one odd peer
-  cannot set a whole category. The result is adjusted by 7-day TVL growth (±30% growth moves
-  value by up to ±12%) and by age (a protocol that has run up to 4 years with no token gets
-  up to 8% more than a brand-new one). Low/high use the category’s 25th/75th percentile ratio.
-  Nothing is hardcoded by name: the ranking follows from the snapshot’s own figures.</p>
-  <p><strong>“Records no token” is not “has no token.”</strong> A protocol is on this board when
-  DefiLlama’s record carries no symbol, gecko id or market cap for it. It may still have a token
-  the record does not carry. Wrapped, staked and bridged products of tokens that already trade,
-  and exchanges, are left out. Gas costs in the farm plans are rough per-transaction estimates
-  for the chain, not quotes. This is research, not financial advice, and it never predicts
-  whether or when a token launches.</p>
-  <p class="src">Data: DefiLlama public protocols snapshot, fetched 2026-11-14. Board generated from
-  that snapshot alone; no live data. Pre-token watchlist: 40 protocols at or above $50M TVL.</p>
+<footer>
+  <p>Method: implied value = TVL × exp(fitted log multiple). The multiple is fit by OLS on the already-tokened protocols (intercept, size, 7-day growth, age) plus a category effect that only counts with ≥3 launched peers. Ranges come from a 200-refit bootstrap. Farm economics use the parameter table above. A protocol “records no token” when DefiLlama carries no symbol, gecko id or market cap for it — that is a record, not proof. Nothing here is financial advice, and no token is guaranteed.</p>
 </footer>
 <script src="data.js"></script>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>
