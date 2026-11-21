@@ -3,13 +3,6 @@
   --line:#ddd5c4; --accent:#0b5fff; --soft:#e4ecff; --good:#0a7a3d; --good-bg:#e2f4e8;
   --bad:#b3261e; --bad-bg:#fbe7e5; --amber:#8a6100; --amber-bg:#fdf3d7; --radius:10px;
 }
-@media (prefers-color-scheme: dark){
-  :root{
-    --bg:#171410; --surface:#211d18; --surface2:#2b2620; --text:#f2ede3; --muted:#a89e8d;
-    --line:#3b342a; --accent:#7aa7ff; --soft:#22345c; --good:#5fd598; --good-bg:#16351f;
-    --bad:#ff8a80; --bad-bg:#3d1d1a; --amber:#e8b84b; --amber-bg:#3a2f10;
-  }
-}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 .top{max-width:1060px;margin:0 auto;padding:28px 18px 10px;display:flex;gap:24px;flex-wrap:wrap;justify-content:space-between;align-items:flex-end}
@@ -46,6 +39,10 @@ table.params th{font-size:12px;text-transform:uppercase;letter-spacing:.4px;colo
 .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 .controls input,.controls select,.controls button{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text)}
 .controls input{flex:1;min-width:180px}
+.controls label{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.controls label input{flex:none;min-width:0;width:110px}
+#scatter{width:100%;height:auto;display:block;color:var(--text)}
+#scatter text{font-family:inherit}
 .count{margin-left:auto;color:var(--muted);font-size:13px}
 .tablewrap{overflow-x:auto}
 table#board{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}
@@ -61,7 +58,7 @@ table#board{border-collapse:collapse;width:100%;font-size:13px;white-space:nowra
 .pill.MARGINAL{background:var(--amber-bg);color:var(--amber)}
 .pill.SKIP{background:var(--bad-bg);color:var(--bad)}
 .neg{color:var(--bad)} .pos{color:var(--good)}
-#back{font:inherit;padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);cursor:pointer;margin-bottom:12px}
+#back{font:inherit;padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);margin-bottom:12px}
 .detail h3{margin:4px 0 2px;font-size:24px}
 .detail .big{font-size:26px;font-weight:800}
 .detail h4{margin:18px 0 8px;font-size:15px}

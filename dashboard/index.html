@@ -16,25 +16,6 @@
   <div class="kpis" id="kpis"></div>
 </header>
 
-<main>
-  <section class="card" id="ledgerCard">
-    <h2>Coverage ledger — every protocol in the snapshot, exactly once</h2>
-    <p class="note">A protocol is “already tokened” when <i>any</i> of its token fields (gecko id, symbol, market cap) says so. The snapshot’s fields disagree for 272 protocols — a gecko id and symbol, but no market cap — and those count as tokened, the conservative reading. “Records no token” is a record, never proof a protocol has none.</p>
-    <div class="ledger" id="ledger"></div>
-    <div class="excluded" id="excluded"></div>
-  </section>
-
-  <section class="card" id="modelCard">
-    <h2>How the value is made — and how wrong it usually is</h2>
-    <div id="model"></div>
-  </section>
-
-  <section class="card" id="paramsCard">
-    <h2>Farm assumptions — one table, everything the verdicts rest on</h2>
-    <p class="note">These are assumptions, not snapshot facts. Change one and the verdicts move; the table is here so a reader can see exactly what they are.</p>
-    <div id="params"></div>
-  </section>
-
   <section class="card">
     <h2>The board</h2>
     <div class="controls">
@@ -44,6 +25,12 @@
       <select id="fVerdict" aria-label="Verdict">
         <option value="">All verdicts</option><option>FARM</option><option>MARGINAL</option><option>SKIP</option>
       </select>
+      <label>Rank by
+        <select id="rankBy" aria-label="Rank by">
+          <option value="value">Value if it launches</option>
+          <option value="expected">Expected value (value × odds)</option>
+        </select>
+      </label>
       <button id="reset" type="button">Reset</button>
       <span class="count" id="count"></span>
     </div>
@@ -52,15 +39,54 @@
         <thead><tr>
           <th data-k="rank">#</th><th data-k="name">Protocol</th><th data-k="category">Category</th>
           <th data-k="chain">Chain</th><th data-k="tvl">TVL</th><th data-k="chg">7D</th>
-          <th data-k="odds">Token odds</th>
+          <th data-k="odds">Odds</th>
           <th data-k="value">Value if it launches</th><th data-k="verdict">Verdict</th>
           <th data-k="net">Net</th><th data-k="perHr">$/hour</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
     </div>
-    <p class="note">Click a row for the full derivation, the farm plan and the peers. Value is the headline: what the token would be worth if it launches. Token odds feed only the farm decision, never the ranking.</p>
+    <p class="note" id="rankNote">Click a row for the full derivation and the farm plan. Value is the headline: what the token would be worth if it launches. Token odds feed only the farm decision, never the ranking.</p>
   </section>
+
+<main>
+  <section class="card" id="ledgerCard">
+    <h2>Coverage ledger — every protocol in the snapshot, exactly once</h2>
+    <p class="note">“Already tokened” means <i>any</i> token field says so. The fields disagree for 272 protocols — a gecko id and symbol, but no market cap — and those count as tokened, the conservative reading.</p>
+    <div class="ledger" id="ledger"></div>
+    <div class="excluded" id="excluded"></div>
+  </section>
+
+  <section class="card" id="modelCard">
+    <h2>How the value is made — and how wrong it usually is</h2>
+    <div id="model"></div>
+  </section>
+
+  <section class="card" id="scatterCard">
+    <h2>Market cap vs TVL — where the curve comes from</h2>
+    <p class="note">Filled dots are launched tokens; open dots are the board at implied value. The line is the fitted size curve.</p>
+    <div class="controls">
+      <select id="sShow" aria-label="Show">
+        <option value="both">Launched + still to come</option>
+        <option value="traded">Launched tokens only</option>
+        <option value="ranked">Still to come only</option>
+      </select>
+    </div>
+    <svg id="scatter" viewBox="0 0 640 380" width="100%" height="380" role="img" aria-label="Market cap against TVL"></svg>
+  </section>
+
+  <section class="card" id="paramsCard">
+    <h2>Farm assumptions — one table, everything the verdicts rest on</h2>
+    <p class="note">Assumptions, not snapshot facts. Change the deposit, drop share or T-bill rate and every verdict and net on this page moves. The board file is written at the defaults, so the default view always agrees with it.</p>
+    <div class="controls">
+      <label>Deposit $ <input id="cDeposit" type="number" min="100" step="100" value="10000" aria-label="Deposit in dollars"></label>
+      <label>Drop share % <input id="cDrop" type="number" min="0.5" max="100" step="0.5" value="5" aria-label="Drop share in percent"></label>
+      <label>T-bill % / yr <input id="cTbill" type="number" min="0" max="20" step="0.5" value="4" aria-label="T-bill rate in percent per year"></label>
+      <button id="cReset" type="button">Reset to defaults</button>
+    </div>
+    <div id="params"></div>
+  </section>
+
 
   <section class="card" id="detailCard" hidden>
     <button id="back" type="button">← Back to the board</button>
@@ -69,7 +95,7 @@
 </main>
 
 <footer>
-  <p>Method: implied value = TVL × exp(fitted log multiple). The multiple is fit by OLS on the already-tokened protocols (intercept, size, 7-day growth, age) plus a category effect that only counts with ≥3 launched peers. Ranges come from a 200-refit bootstrap. Farm economics use the parameter table above. A protocol “records no token” when DefiLlama carries no symbol, gecko id or market cap for it — that is a record, not proof. Nothing here is financial advice, and no token is guaranteed.</p>
+  <p>Method: value = TVL × exp(fitted log multiple), Huber fit on launched tokens with market cap ≥ $1M. Ranges from leave-one-out residuals; rank ranges from a 200-refit bootstrap. Farm figures use the parameter table above. Page figures are rounded to the nearest $100K; exact names and dollars are in the board file. “Records no token” is a record, not proof. Not financial advice.</p>
 </footer>
 <script src="data.js"></script>
 <script type="module" src="app.js"></script>

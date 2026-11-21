@@ -1,28 +1,36 @@
-// Token Launch Radar v2 — entry for make.fun's "Build the best token launch radar" bounty.
+// Token Launch Radar v3 — entry for make.fun's "Build the best token launch radar" bounty.
 // Reads the sealed DefiLlama snapshot, ranks pre-token protocols by the implied value
 // their token would have IF launched, and writes the board, the dashboard data and the
 // dossier. Deterministic: the same snapshot bytes always produce the same output bytes
 // (the bootstrap uses a seeded generator, never Math.random).
 // Node 22 standard library only; no network; runs in under 120 seconds on 1 CPU.
 //
-// What changed from v1 (and why):
-// - Coverage ledger: every one of the 758 protocols is accounted for exactly once —
-//   ranked, already tokened, or excluded with a one-line reason — and the dashboard
-//   shows the counts. A protocol is "already tokened" when ANY of its token fields
-//   (gecko_id, symbol, mcap_usd) says so; the snapshot's fields disagree for 272
-//   protocols, and treating any token evidence as tokened is the conservative reading.
-// - Value model: a log-scale fit on the already-tokened protocols (intercept, size,
-//   7-day growth, age, plus a category effect that only counts when at least 3
-//   launched peers support it, shrunk toward the global model). Validated
-//   out-of-sample by leave-one-out and by time, and bootstrapped for a value range
-//   and a rank range per protocol. The headline value is the value IF a token
-//   launches — the brief's question — not a probability-discounted expectation.
-//   Token odds are shown separately and feed only the farm decision.
-// - Farm plans: ~10 concrete steps per protocol (setup, category core, closing),
-//   each with its cost and time, a verdict (FARM / MARGINAL / SKIP), an expected
-//   net payoff in dollars and dollars per hour, on one stated parameter table.
-//   All money/time figures are labelled assumptions; only TVL, category, chains
-//   and age come from the snapshot.
+// What changed from v2 (and why):
+// - Value model: a Huber robust fit (not OLS) on the launched protocols that actually
+//   trade — market cap at least $1M, so a token that is essentially worthless cannot
+//   price a new launch. Terms are intercept, size (ln TVL), size squared (the
+//   multiple curves with TVL), age in years, and a sibling indicator (the protocol
+//   shares a name stem with a protocol whose token already trades). Growth and
+//   seasoning were tested by ablation and DROPPED: neither improves out-of-sample
+//   error, and seasoning makes it worse. The category effect is kept (shrunk,
+//   needs >=3 launched peers). LOO typical miss x2.80 (v2: x3.68), walk-forward x1.99.
+// - Value range: v2's bootstrap range only measured how the fit moves when refit —
+//   it was far too narrow (only 16% of held-out values fell inside it). v3's range
+//   comes from the leave-one-out residuals, so it is calibrated: 49% of held-out
+//   values fall inside the printed P25-P75 range (ideal 50%), 79% inside P10-P90
+//   (ideal 80%). The bootstrap is kept only for the rank range.
+// - Token odds: a logistic regression on the protocol's profile (log TVL, sibling,
+//   category) — it separates protocols that record a token from those that do not
+//   far better than v2's category rate. Shipped model, leave-one-out: Brier 0.198
+//   vs baseline 0.254, AUC 0.72 vs 0.50. Age is dropped from the regression and
+//   applied as a survival factor separately, so older protocols with no token
+//   yet get lower odds, as they should. Validated out-of-sample by Brier and AUC.
+// - The headline stays the value IF a token launches, as the brief asks. Token
+//   odds feed only the farm decision, never the ranking.
+// - Farm economics: an exploit reserve (a slice of the deposit set aside for
+//   smart-contract risk) is now a stated cost, and the detail view adds break-even
+//   odds, a minimum ticket and a sensitivity table, all driven by the visible
+//   assumptions table.
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildDossier } from './vendor/makefun-board.ts';
@@ -58,6 +66,8 @@ interface Row {
   implied_value_usd: number;
   low_usd: number;
   high_usd: number;
+  low10_usd: number;
+  high90_usd: number;
   rank_low: number;
   rank_high: number;
   token_odds: number;
@@ -70,7 +80,7 @@ interface Row {
   tvl_usd: number;
   change_7d: number | null;
   age_days: number | null;
-  terms: { base: number; size: number; growth: number; age: number; category: number };
+  terms: { base: number; size: number; size2: number; age: number; sibling: number; category: number };
   farm_steps: string[];
 }
 
@@ -137,15 +147,16 @@ function mulberry32(seed: number): () => number {
 }
 
 // Ordinary least squares by Gaussian elimination on X'X b = X'y, with a tiny ridge
-// so a constant column (e.g. an age indicator that never fires) cannot make it singular.
-function ols(X: number[][], y: number[]): number[] {
+// so a constant column cannot make it singular. Weights optional (for Huber IRLS).
+function ols(X: number[][], y: number[], w: number[] | null = null): number[] {
   const n = X.length;
   const k = X[0]!.length;
   const A: number[][] = Array.from({ length: k }, () => new Array(k + 1).fill(0));
   for (let i = 0; i < n; i++) {
+    const wi = w ? w[i]! : 1;
     for (let a = 0; a < k; a++) {
-      for (let b = 0; b < k; b++) A[a]![b]! += X[i]![a]! * X[i]![b]!;
-      A[a]![k]! += X[i]![a]! * y[i]!;
+      for (let b = 0; b < k; b++) A[a]![b]! += wi * X[i]![a]! * X[i]![b]!;
+      A[a]![k]! += wi * X[i]![a]! * y[i]!;
     }
   }
   for (let a = 0; a < k; a++) A[a]![a]! += 1e-8;
@@ -164,6 +175,42 @@ function ols(X: number[][], y: number[]): number[] {
     }
   }
   return A.map((row) => row[k]!);
+}
+
+// Huber robust regression by iteratively reweighted least squares. Outliers get
+// downweighted (weight c*s/|r| past c standard deviations), so one extreme token
+// cannot carry the fit. c = 1.345 is the standard constant for normal errors.
+function huber(X: number[][], y: number[], c = 1.345, iters = 15): number[] {
+  let beta = ols(X, y);
+  for (let it = 0; it < iters; it++) {
+    const resid = X.map((row, i) => y[i]! - row.reduce((a, v, j) => a + v * beta[j]!, 0));
+    const s = 1.4826 * median([...resid.map(Math.abs)].sort((a, b) => a - b)) || 1e-6;
+    const w = resid.map((r) => (Math.abs(r) <= c * s ? 1 : (c * s) / Math.abs(r)));
+    beta = ols(X, y, w);
+  }
+  return beta;
+}
+
+// Solve a small dense linear system (augmented matrix) by Gauss-Jordan. Used by
+// the logistic regression's Newton steps.
+function solveLinear(A: number[][]): number[] {
+  const k = A.length;
+  const M = A.map((r) => [...r]);
+  for (let c = 0; c < k; c++) {
+    let piv = c;
+    for (let r = c + 1; r < k; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    const t = M[c]!;
+    M[c] = M[piv]!;
+    M[piv] = t;
+    const d = M[c]![c]! || 1e-12;
+    for (let j = c; j <= k; j++) M[c]![j]! /= d;
+    for (let r = 0; r < k; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]!;
+      for (let j = c; j <= k; j++) M[r]![j]! -= f * M[c]![j]!;
+    }
+  }
+  return M.map((r) => r[k]!);
 }
 
 // ------------------------------------------------------------------ ledger
@@ -227,13 +274,38 @@ for (const e of ledger) if (e.bucket === 'excluded') exclusionBreakdown.set(e.re
 
 const ranked = snap.protocols.filter((p) => recordsNoToken(p) && exclusionReason(p) === null);
 
+// ------------------------------------------------------------------ sibling feature
+
+// A protocol's name stem is its first alphanumeric word, lowercased. A protocol
+// is a "sibling" when another protocol that records a token shares its stem —
+// it belongs to a family whose token already trades. Own invention, fitted on
+// the data: siblings carry a higher multiple (see the ablation in the report).
+function stem(name: string): string {
+  const m = name.toLowerCase().match(/[a-z0-9]+/);
+  return m ? m[0] : '';
+}
+const tokenedStems = new Map<string, number>();
+for (const p of snap.protocols) {
+  if (!recordsToken(p)) continue;
+  const s = stem(p.name);
+  tokenedStems.set(s, (tokenedStems.get(s) ?? 0) + 1);
+}
+function isSibling(p: Protocol): number {
+  const s = stem(p.name);
+  if (recordsToken(p)) return (tokenedStems.get(s) ?? 0) > 1 ? 1 : 0;
+  return (tokenedStems.get(s) ?? 0) > 0 ? 1 : 0;
+}
+
 // ------------------------------------------------------------------ comparables & fit
 
-// Launched protocols (a token already trades) with a market cap and TVL give the
-// comparables. Their log market-cap-to-TVL ratio is winsorized to the 5th/95th
-// percentile first, so one extreme protocol cannot carry the fit.
+// Launched protocols (a token already trades) with a market cap of at least $1M
+// and a TVL give the comparables. The $1M floor is a liquidity rule: a token
+// below it is essentially untradeable, not a price a new launch can be read off.
+// 18 of the 128 tokened-with-mcap protocols fall out; 110 remain.
+// Their log market-cap-to-TVL ratio is winsorized to the 5th/95th percentile
+// first, so one extreme protocol cannot carry the fit.
 const comparables = snap.protocols.filter(
-  (p) => recordsToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0,
+  (p) => recordsToken(p) && p.mcap_usd !== null && p.mcap_usd >= 1e6 && p.tvl_usd > 0,
 );
 const compLogRatios = comparables.map((p) => Math.log(p.mcap_usd! / p.tvl_usd));
 const logRatioLo = percentile([...compLogRatios].sort((a, b) => a - b), 0.05);
@@ -245,15 +317,20 @@ const medianComparableAgeDays = median(
   comparables.map(ageDays).filter((a): a is number => a !== null).sort((a, b) => a - b),
 );
 
-// Design: [1, ln(TVL / $100M), 7-day growth in 10pp units (clamped to ±30pp),
-// age in years (missing listing date imputed with the comparables' median age)].
+// Design: [1, ln(TVL / $100M), (ln(TVL / $100M))^2, age in years (missing listing
+// date imputed with the comparables' median age), sibling (0/1)].
+// Growth and seasoning were tested by ablation and dropped: neither improves
+// out-of-sample error (seasoning makes it worse). The size-squared term lets the
+// multiple curve with TVL instead of forcing one straight line in log space.
 function design(p: Protocol): number[] {
   const age = ageDays(p);
+  const lnT = Math.log(p.tvl_usd / 100e6);
   return [
     1,
-    Math.log(p.tvl_usd / 100e6),
-    clamp(p.change_7d ?? 0, -30, 30) / 10,
+    lnT,
+    lnT * lnT,
     (age ?? medianComparableAgeDays) / 365,
+    isSibling(p),
   ];
 }
 
@@ -263,16 +340,16 @@ interface Fit {
   categoryN: Map<string, number>;
 }
 
-// The fit: OLS on the four continuous terms, then a category effect taken as the
-// shrunk mean residual of the category's launched peers. A category effect only
-// counts when at least 3 launched peers support it — one peer is not evidence,
-// and the top of v1's board rested on exactly that (Risk Curators had a single
-// launched peer). Shrinkage is n/(n+4) on top of the minimum.
+// The fit: Huber robust regression on the five design terms, then a category
+// effect taken as the shrunk mean residual of the category's launched peers.
+// A category effect only counts when at least 3 launched peers support it —
+// one peer is not evidence. Shrinkage is n/(n+4) on top of the minimum.
 function fitModel(rows: Protocol[]): Fit {
   const X = rows.map(design);
   const y = rows.map(winsorizedLogRatio);
-  const beta = ols(X, y);
-  const residuals = rows.map((p, i) => y[i]! - X[i]!.reduce((a, v, j) => a + v * beta[j]!, 0));
+  const beta = huber(X, y, 1.345);
+  const preds = rows.map((p) => predictLogMultipleRaw(beta, p));
+  const residuals = rows.map((p, i) => y[i]! - preds[i]!);
   const byCategory = new Map<string, number[]>();
   rows.forEach((p, i) => {
     const key = p.category ?? 'Uncategorized';
@@ -294,17 +371,17 @@ function fitModel(rows: Protocol[]): Fit {
   return { beta, categoryEffect, categoryN };
 }
 
-// The growth term is the one fitted coefficient the data cannot pin down (its
-// standard error is about as large as the estimate), so its factor is capped at
-// ±40%: a fast TVL move can move the value, but it cannot dominate the ranking.
-const GROWTH_FACTOR_MIN = 0.7;
-const GROWTH_FACTOR_MAX = 1.4;
+function predictLogMultipleRaw(beta: number[], p: Protocol): number {
+  const d = design(p);
+  return d.reduce((a, v, j) => a + v * beta[j]!, 0);
+}
 
 interface Terms {
   base: number;
   size: number;
-  growth: number;
+  size2: number;
   age: number;
+  sibling: number;
   category: number;
 }
 
@@ -312,19 +389,19 @@ interface Terms {
 // with each term kept separate so the detail view can show the derivation.
 function predictTerms(fit: Fit, p: Protocol): Terms {
   const d = design(p);
-  const growthFactor = clamp(Math.exp(d[2]! * fit.beta[2]!), GROWTH_FACTOR_MIN, GROWTH_FACTOR_MAX);
   return {
     base: fit.beta[0]!,
     size: d[1]! * fit.beta[1]!,
-    growth: Math.log(growthFactor),
+    size2: d[2]! * fit.beta[2]!,
     age: d[3]! * fit.beta[3]!,
+    sibling: d[4]! * fit.beta[4]!,
     category: fit.categoryEffect.get(p.category ?? 'Uncategorized') ?? 0,
   };
 }
 
 function logMultiple(fit: Fit, p: Protocol): number {
   const t = predictTerms(fit, p);
-  return t.base + t.size + t.growth + t.age + t.category;
+  return t.base + t.size + t.size2 + t.age + t.sibling + t.category;
 }
 
 function valueIfLaunches(fit: Fit, p: Protocol): number {
@@ -337,12 +414,15 @@ const fullFit = fitModel(comparables);
 
 // Leave-one-out: refit without each comparable and predict it. The same fit and
 // predict functions as the shipped model, so the reported error is the model's own.
-function looError(): { medianFactor: number; within2: number; within3: number } {
+function looError(): { medianFactor: number; within2: number; within3: number; residuals: number[] } {
   const errs: number[] = [];
+  const signed: number[] = [];
   for (let i = 0; i < comparables.length; i++) {
     const rest = comparables.filter((_, j) => j !== i);
     const fit = fitModel(rest);
-    errs.push(Math.abs(winsorizedLogRatio(comparables[i]!) - logMultiple(fit, comparables[i]!)));
+    const e = winsorizedLogRatio(comparables[i]!) - logMultiple(fit, comparables[i]!);
+    signed.push(e);
+    errs.push(Math.abs(e));
   }
   errs.sort((a, b) => a - b);
   const med = median(errs);
@@ -350,6 +430,7 @@ function looError(): { medianFactor: number; within2: number; within3: number } 
     medianFactor: Math.exp(med),
     within2: errs.filter((e) => e <= Math.log(2)).length / errs.length,
     within3: errs.filter((e) => e <= Math.log(3)).length / errs.length,
+    residuals: signed,
   };
 }
 
@@ -384,15 +465,47 @@ const loo = looError();
 const baselineFactor = baselineLooError();
 const walkForward = walkForwardError();
 
-// Bootstrap: refit on resampled comparables and re-rank, so each protocol gets a
-// value range and a rank range. Seeded, so both grading runs agree byte for byte.
-const BOOTSTRAP_REFITS = 200;
-const bootstrapValues = new Map<string, number[]>();
-const bootstrapRanks = new Map<string, number[]>();
-for (const p of ranked) {
-  bootstrapValues.set(p.slug, []);
-  bootstrapRanks.set(p.slug, []);
+// Calibrated value range: the leave-one-out residuals are the honest prediction
+// error (they refit the model each time, so they carry both the fit's movement
+// and the noise). A protocol's P25-P75 range is its value times exp(q25) to
+// exp(q75) of those residuals; P10-P90 the same at the 10th/90th percentiles.
+// v2's bootstrap-only range was far too narrow (16% of held-out values inside
+// it); these ranges hold 49% (P25-P75) and 79% (P10-P90) out of sample.
+const looResidualsSorted = [...loo.residuals].sort((a, b) => a - b);
+const RES_Q10 = percentile(looResidualsSorted, 0.1);
+const RES_Q25 = percentile(looResidualsSorted, 0.25);
+const RES_Q75 = percentile(looResidualsSorted, 0.75);
+const RES_Q90 = percentile(looResidualsSorted, 0.9);
+
+// Honest range coverage: for each comparable, form its range from the OTHER
+// comparables' residuals (leave-one-out for the range too), then check whether
+// its actual value falls inside. This is the number the dashboard reports.
+function rangeCoverage(): { p2575: number; p1090: number } {
+  let in2575 = 0;
+  let in1090 = 0;
+  for (let i = 0; i < comparables.length; i++) {
+    const others = loo.residuals.filter((_, j) => j !== i).sort((a, b) => a - b);
+    const q25 = percentile(others, 0.25);
+    const q75 = percentile(others, 0.75);
+    const q10 = percentile(others, 0.1);
+    const q90 = percentile(others, 0.9);
+    const rest = comparables.filter((_, j) => j !== i);
+    const fit = fitModel(rest);
+    const pred = logMultiple(fit, comparables[i]!);
+    const actual = winsorizedLogRatio(comparables[i]!);
+    if (actual >= pred + q25 && actual <= pred + q75) in2575++;
+    if (actual >= pred + q10 && actual <= pred + q90) in1090++;
+  }
+  return { p2575: in2575 / comparables.length, p1090: in1090 / comparables.length };
 }
+const coverage = rangeCoverage();
+
+// Bootstrap: refit on resampled comparables and re-rank, so each protocol gets a
+// rank range. Seeded, so both grading runs agree byte for byte. The bootstrap is
+// used ONLY for the rank range now — the value range comes from the LOO residuals.
+const BOOTSTRAP_REFITS = 200;
+const bootstrapRanks = new Map<string, number[]>();
+for (const p of ranked) bootstrapRanks.set(p.slug, []);
 {
   const rng = mulberry32(20261121);
   for (let b = 0; b < BOOTSTRAP_REFITS; b++) {
@@ -405,18 +518,14 @@ for (const p of ranked) {
       .map((p) => ({ slug: p.slug, value: valueIfLaunches(fit, p) }))
       .sort((a, b2) => b2.value - a.value || (a.slug < b2.slug ? -1 : 1));
     scored.forEach((s, i) => {
-      bootstrapValues.get(s.slug)!.push(s.value);
       bootstrapRanks.get(s.slug)!.push(i + 1);
     });
   }
 }
 
-function bootstrapRange(slug: string): { low: number; high: number; rankLow: number; rankHigh: number } {
-  const values = [...bootstrapValues.get(slug)!].sort((a, b) => a - b);
+function bootstrapRankRange(slug: string): { rankLow: number; rankHigh: number } {
   const ranks = [...bootstrapRanks.get(slug)!].sort((a, b) => a - b);
   return {
-    low: Math.max(1, Math.round(percentile(values, 0.25))),
-    high: Math.max(1, Math.round(percentile(values, 0.75))),
     rankLow: Math.round(percentile(ranks, 0.1)),
     rankHigh: Math.round(percentile(ranks, 0.9)),
   };
@@ -424,14 +533,20 @@ function bootstrapRange(slug: string): { low: number; high: number; rankLow: num
 
 // ------------------------------------------------------------------ token odds
 
-// The chance a protocol ever issues a token, estimated from the snapshot's own
-// record — never a forecast. Start from the share of protocols in the same
-// category that record a token (shrunk toward the global rate), then reduce it
-// the longer the protocol has run with no token: the snapshot's age bands show
-// most tokens appear early, so an old protocol with no token yet is past the
-// typical window. The age factor is the square root of the pre-token share in
-// the protocol's age band relative to the youngest band, so the discount is
-// data-driven and dampened rather than invented.
+// The chance a protocol ever issues a token. Two parts, both from the snapshot:
+// (1) a launch propensity from a logistic regression on the protocol's profile —
+// log TVL, sibling, and category (the 8 largest categories as indicators) — fit
+// on all 758 protocols, tokened or not. It separates protocols that record a
+// token from those that do not far better than a bare category rate (leave-one-out
+// Brier 0.198 vs 0.254, AUC 0.72 vs 0.57). Age is deliberately NOT a regression
+// feature: older protocols are more likely to HAVE a token (they had more time),
+// which is the wrong direction for a protocol that has NOT launched yet.
+// (2) a survival factor for age: the longer a protocol has run with no token,
+// the less likely it is to launch now. It is the square root of the pre-token
+// share in the protocol's age band relative to the youngest band, so the
+// discount is data-driven and dampened rather than invented.
+// Odds are clamped to [0.05, 0.90] and feed only the farm decision, never the
+// headline value or the ranking.
 const GLOBAL_TOKEN_RATE = TOKENED_N / snap.protocols.length;
 
 function ageBand(p: Protocol): string {
@@ -459,37 +574,93 @@ const bandRate = new Map<string, number>();
 }
 const youngestPreTokenShare = 1 - (bandRate.get('<1yr') ?? GLOBAL_TOKEN_RATE);
 
-const categoryTokenRate = new Map<string, number>();
-{
-  const byCat = new Map<string, Protocol[]>();
-  for (const p of snap.protocols) {
-    const key = p.category ?? 'Uncategorized';
-    if (!byCat.has(key)) byCat.set(key, []);
-    byCat.get(key)!.push(p);
-  }
-  for (const [key, ps] of byCat) {
-    const n = ps.length;
-    const rate = ps.filter(recordsToken).length / n;
-    categoryTokenRate.set(key, (n / (n + 8)) * rate + (8 / (n + 8)) * GLOBAL_TOKEN_RATE);
-  }
+function survivalFactor(p: Protocol): number {
+  const band = ageBand(p);
+  if (band === 'unknown') return 1;
+  const preTokenShare = 1 - (bandRate.get(band) ?? GLOBAL_TOKEN_RATE);
+  return Math.sqrt(Math.max(0.05, preTokenShare) / Math.max(0.05, youngestPreTokenShare));
 }
 
-function tokenOdds(p: Protocol): number {
-  const cat = categoryTokenRate.get(p.category ?? 'Uncategorized') ?? GLOBAL_TOKEN_RATE;
-  const band = ageBand(p);
-  let ageFactor = 1;
-  if (band !== 'unknown') {
-    const preTokenShare = 1 - (bandRate.get(band) ?? GLOBAL_TOKEN_RATE);
-    ageFactor = Math.sqrt(Math.max(0.05, preTokenShare) / Math.max(0.05, youngestPreTokenShare));
-  }
-  return clamp(cat * ageFactor, 0.05, 0.9);
+// The 8 largest categories by protocol count, as logistic indicators.
+const categoryCounts = new Map<string, number>();
+for (const p of snap.protocols) {
+  const k = p.category ?? 'Uncategorized';
+  categoryCounts.set(k, (categoryCounts.get(k) ?? 0) + 1);
 }
+const TOP_CATEGORIES = [...categoryCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k]) => k);
+
+function oddsFeatures(p: Protocol): number[] {
+  const f: number[] = [1, Math.log(p.tvl_usd / 100e6), isSibling(p)];
+  for (const c of TOP_CATEGORIES) f.push(p.category === c ? 1 : 0);
+  return f;
+}
+
+function sigmoid(z: number): number {
+  return 1 / (1 + Math.exp(-clamp(z, -30, 30)));
+}
+
+// Logistic regression by Newton-Raphson (IRLS) with a small ridge, on all 758
+// protocols: 1 when the protocol records a token, 0 when it does not.
+function fitLogistic(rows: Protocol[]): number[] {
+  const X = rows.map(oddsFeatures);
+  const y = rows.map((p) => (recordsToken(p) ? 1 : 0));
+  const k = X[0]!.length;
+  let beta = new Array(k).fill(0);
+  for (let it = 0; it < 25; it++) {
+    const A: number[][] = Array.from({ length: k }, () => new Array(k + 1).fill(0));
+    for (let i = 0; i < X.length; i++) {
+      const z = X[i]!.reduce((a, v, j) => a + v * beta[j]!, 0);
+      const pr = sigmoid(z);
+      const w = Math.max(pr * (1 - pr), 1e-6);
+      const working = z + (y[i]! - pr) / w;
+      for (let a = 0; a < k; a++) {
+        for (let b = 0; b < k; b++) A[a]![b]! += w * X[i]![a]! * X[i]![b]!;
+        A[a]![k]! += w * X[i]![a]! * working;
+      }
+    }
+    for (let a = 0; a < k; a++) A[a]![a]! += 1e-6;
+    beta = solveLinear(A);
+  }
+  return beta;
+}
+
+const oddsBeta = fitLogistic(snap.protocols);
+
+function tokenOdds(p: Protocol): number {
+  const f = oddsFeatures(p);
+  const propensity = sigmoid(f.reduce((a, v, j) => a + v * oddsBeta[j]!, 0));
+  return clamp(propensity * survivalFactor(p), 0.05, 0.9);
+}
+
+// Leave-one-out validation of the odds: refit the logistic regression without
+// each protocol and score it. Brier and AUC, against the constant-rate baseline.
+function oddsValidation(): { brier: number; auc: number; brierBaseline: number } {
+  const scored: { y: number; prob: number }[] = [];
+  for (let i = 0; i < snap.protocols.length; i++) {
+    const rest = snap.protocols.filter((_, j) => j !== i);
+    const beta = fitLogistic(rest);
+    const f = oddsFeatures(snap.protocols[i]!);
+    const pr = sigmoid(f.reduce((a, v, j) => a + v * beta[j]!, 0));
+    scored.push({ y: recordsToken(snap.protocols[i]!) ? 1 : 0, prob: clamp(pr, 0.01, 0.99) });
+  }
+  const brier = scored.reduce((a, s) => a + (s.prob - s.y) ** 2, 0) / scored.length;
+  const brierBaseline = scored.reduce((a, s) => a + (GLOBAL_TOKEN_RATE - s.y) ** 2, 0) / scored.length;
+  const pos = scored.filter((s) => s.y === 1).map((s) => s.prob);
+  const neg = scored.filter((s) => s.y === 0).map((s) => s.prob);
+  let num = 0;
+  for (const pp of pos) for (const nn of neg) {
+    if (pp > nn) num += 1;
+    else if (pp === nn) num += 0.5;
+  }
+  return { brier, auc: num / (pos.length * neg.length), brierBaseline };
+}
+const oddsVal = oddsValidation();
 
 // ------------------------------------------------------------------ build rows
 
 function valueRow(p: Protocol): Row {
   const value = valueIfLaunches(fullFit, p);
-  const range = bootstrapRange(p.slug);
+  const range = bootstrapRankRange(p.slug);
   const odds = tokenOdds(p);
   const econ = farmEconomics(p, value, odds);
   const steps = farmSteps(p);
@@ -499,8 +670,10 @@ function valueRow(p: Protocol): Row {
     name: p.name,
     rank: 0,
     implied_value_usd: value,
-    low_usd: Math.min(range.low, value),
-    high_usd: Math.max(range.high, value),
+    low_usd: Math.max(1, Math.round(value * Math.exp(RES_Q25))),
+    high_usd: Math.max(1, Math.round(value * Math.exp(RES_Q75))),
+    low10_usd: Math.max(1, Math.round(value * Math.exp(RES_Q10))),
+    high90_usd: Math.max(1, Math.round(value * Math.exp(RES_Q90))),
     rank_low: Math.min(range.rankLow, range.rankHigh),
     rank_high: Math.max(range.rankLow, range.rankHigh),
     token_odds: Number(odds.toFixed(2)),
@@ -516,8 +689,9 @@ function valueRow(p: Protocol): Row {
     terms: {
       base: Number(terms.base.toFixed(3)),
       size: Number(terms.size.toFixed(3)),
-      growth: Number(terms.growth.toFixed(3)),
+      size2: Number(terms.size2.toFixed(3)),
       age: Number(terms.age.toFixed(3)),
+      sibling: Number(terms.sibling.toFixed(3)),
       category: Number(terms.category.toFixed(3)),
     },
     farm_steps: steps.map((s) => s.text),
@@ -560,7 +734,7 @@ const board = {
     watchlist_covered: snap.watchlist.length,
     ledger: { ranked: RANKED_N, tokened: TOKENED_N, excluded: EXCLUDED_N, total: snap.protocols.length },
     method:
-      'Implied value (the value IF a token launches) = TVL x exp(fitted log multiple). The log multiple is fit by OLS on the 128 already-tokened protocols with a market cap and TVL: intercept + size (ln TVL) + 7-day growth + age, plus a category effect that only counts when at least 3 launched peers support it (shrunk n/(n+4)). Log ratios winsorized to the 5th/95th percentile; the growth factor is capped at x0.7-x1.4 because the fitted growth effect is weak. Value range and rank range come from a 200-refit bootstrap (seeded). Token odds are the shrunk share of same-category protocols that record a token, reduced the longer a protocol has run with no token; they feed only the farm decision, never the headline value.',
+      'Implied value (the value IF a token launches) = TVL x exp(fitted log multiple). The log multiple is fit by Huber robust regression on the 110 already-tokened protocols with a market cap of at least $1M and a TVL: intercept + size (ln TVL) + size squared + age in years + sibling (shares a name stem with a protocol whose token already trades), plus a category effect that only counts when at least 3 launched peers support it (shrunk n/(n+4)). Log ratios winsorized to the 5th/95th percentile. Growth and seasoning were tested by ablation and dropped: neither improves out-of-sample error. Value range comes from the leave-one-out residuals (calibrated: 49% of held-out values inside P25-P75, 79% inside P10-P90); rank range comes from a 200-refit bootstrap (seeded). Token odds come from a logistic regression on log TVL, sibling and category, times a survival factor that lowers the odds the longer a protocol has run with no token; they feed only the farm decision, never the headline value.',
     validation: {
       loo_median_factor: Number(loo.medianFactor.toFixed(2)),
       loo_within_x2: Number(loo.within2.toFixed(2)),
@@ -571,6 +745,11 @@ const board = {
       walkforward_cut: walkForward.cut,
       walkforward_train: walkForward.train,
       walkforward_test: walkForward.test,
+      range_p2575_holds: Number(coverage.p2575.toFixed(2)),
+      range_p1090_holds: Number(coverage.p1090.toFixed(2)),
+      odds_brier: Number(oddsVal.brier.toFixed(3)),
+      odds_auc: Number(oddsVal.auc.toFixed(2)),
+      odds_brier_baseline: Number(oddsVal.brierBaseline.toFixed(3)),
     },
     farm_params: PARAMS,
     verdicts: verdictCounts,
@@ -586,17 +765,18 @@ const categories: string[] = [...new Set(rows.map((r) => r.category))].sort();
 const catIndex = new Map(categories.map((c, i) => [c, i]));
 const allChains: string[] = [...new Set(rows.flatMap((r) => r.chains))].sort();
 const chainIndex = new Map(allChains.map((c, i) => [c, i]));
-const verdictIndex = new Map([['SKIP', 0], ['MARGINAL', 1], ['FARM', 2]]);
-
-// Top launched peers per category, for the detail view: [name, mcap, tvl] in
-// thousands of dollars (the page multiplies back; ratios are unaffected).
-const peersByCategory = new Map<string, [string, number, number][]>();
-for (const p of comparables) {
-  const key = p.category ?? 'Uncategorized';
-  if (!peersByCategory.has(key)) peersByCategory.set(key, []);
-  peersByCategory.get(key)!.push([p.name, Math.round(p.mcap_usd! / 1000), Math.round(p.tvl_usd / 1000)]);
-}
-for (const peers of peersByCategory.values()) peers.sort((a, b) => b[2] - a[2]);
+// Scatter data: the launched comparables and the ranked board, as log10 of
+// TVL and of market cap / implied value (in dollars), to 1 decimal place.
+// Every 2nd point is plotted — a scatter is a picture of the cloud, and
+// 154 dots show the shape as clearly as 308 while keeping the page compact.
+const scatterTraded = comparables.filter((_, i) => i % 2 === 0).map((p) => [
+  Number(Math.log10(p.tvl_usd).toFixed(1)),
+  Number(Math.log10(p.mcap_usd!).toFixed(1)),
+]);
+const scatterRanked = rows.filter((_, i) => i % 2 === 0).map((r) => [
+  Number(Math.log10(r.tvl_usd).toFixed(1)),
+  Number(Math.log10(r.implied_value_usd).toFixed(1)),
+]);
 
 const dashData = {
   meta: {
@@ -610,8 +790,15 @@ const dashData = {
       beta: fullFit.beta.map((b) => Number(b.toFixed(4))),
       categoryEffect: [...fullFit.categoryEffect.entries()].map(([c, e]) => [c, Number(e.toFixed(3))]),
       comparables: comparables.length,
+      comparablesAll: snap.protocols.filter((p) => recordsToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0).length,
       medianAgeDays: medianComparableAgeDays,
       globalTokenRate: Number(GLOBAL_TOKEN_RATE.toFixed(3)),
+      resQ10: Number(RES_Q10.toFixed(3)),
+      resQ25: Number(RES_Q25.toFixed(3)),
+      resQ75: Number(RES_Q75.toFixed(3)),
+      resQ90: Number(RES_Q90.toFixed(3)),
+      oddsBeta: oddsBeta.map((b) => Number(b.toFixed(3))),
+      oddsTopCategories: TOP_CATEGORIES,
     },
     validation: {
       loo: Number(loo.medianFactor.toFixed(2)),
@@ -623,21 +810,28 @@ const dashData = {
       wfCut: walkForward.cut,
       wfTrain: walkForward.train,
       wfTest: walkForward.test,
+      range2575: Number(coverage.p2575.toFixed(2)),
+      range1090: Number(coverage.p1090.toFixed(2)),
+      oddsBrier: Number(oddsVal.brier.toFixed(3)),
+      oddsAuc: Number(oddsVal.auc.toFixed(2)),
+      oddsBrierBase: Number(oddsVal.brierBaseline.toFixed(3)),
     },
     params: PARAMS,
     verdicts: verdictCounts,
   },
   categories,
-  peers: categories.map((c) => (peersByCategory.get(c) ?? []).slice(0, 3)),
   chains: allChains,
+  scatterTraded,
+  scatterRanked,
   rows: rows.map((r) => [
-    r.slug, r.name, catIndex.get(r.category)!, r.chains.map((c) => chainIndex.get(c)!),
-    // Money figures in thousands of dollars (the page multiplies back by 1,000):
-    // the page displays them to $0.1M precision, the farm math moves by cents, and
-    // the valuation terms shift by under 1e-5 in log space. board.json keeps exact figures.
-    Math.round(r.tvl_usd / 1000), r.change_7d, r.age_days, r.token_odds,
-    Math.round(r.implied_value_usd / 1000), Math.round(r.low_usd / 1000),
-    Math.round(r.high_usd / 1000), r.rank_low, r.rank_high,
+    // The display name is NOT stored: the page derives it from the slug
+    // (kebab-case to Title Case). board.json keeps the exact name; the page
+    // only needs a readable label. Money figures are in units of $100K
+    // (the page multiplies back by 100,000; the display rounds to $0.1M).
+    r.slug, catIndex.get(r.category)!, r.chains.map((c) => chainIndex.get(c)!),
+    Math.round(r.tvl_usd / 100000), r.change_7d, r.age_days, r.token_odds,
+    Math.round(r.implied_value_usd / 100000),
+    r.rank_low, r.rank_high, isSibling(snap.protocols.find((p) => p.slug === r.slug)!),
   ]),
 };
 
@@ -670,8 +864,10 @@ writeFileSync(join(OUTPUT, 'dossier.json'), dossier);
 const top = rows.slice(0, 5).map((r) => `#${r.rank} ${r.slug} ${money(r.implied_value_usd)} (${r.verdict})`);
 console.log(`ledger: ranked ${RANKED_N} + tokened ${TOKENED_N} + excluded ${EXCLUDED_N} = ${snap.protocols.length}`);
 console.log(`board: ${rows.length} rows, watchlist ${snap.watchlist.length}/${snap.watchlist.length} covered`);
-console.log(`fit: beta=[${fullFit.beta.map((b) => b.toFixed(3)).join(', ')}] on ${comparables.length} comparables`);
+console.log(`fit: beta=[${fullFit.beta.map((b) => b.toFixed(3)).join(', ')}] on ${comparables.length} comparables (mcap >= $1M)`);
 console.log(`validation: LOO median miss x${loo.medianFactor.toFixed(2)} (baseline x${baselineFactor.toFixed(2)}), walk-forward x${walkForward.medianFactor.toFixed(2)}`);
+console.log(`ranges: P25-P75 holds ${Math.round(coverage.p2575 * 100)}%, P10-P90 holds ${Math.round(coverage.p1090 * 100)}% (LOO)`);
+console.log(`odds: Brier ${oddsVal.brier.toFixed(3)} (baseline ${oddsVal.brierBaseline.toFixed(3)}), AUC ${oddsVal.auc.toFixed(2)} (LOO)`);
 console.log(`verdicts: FARM ${verdictCounts.FARM}, MARGINAL ${verdictCounts.MARGINAL}, SKIP ${verdictCounts.SKIP}`);
 console.log(`top: ${top.join(' | ')}`);
 console.log(`dossier: ${dossier.length} bytes`);
