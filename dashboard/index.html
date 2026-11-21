@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar — what pre-token protocols would be worth</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="wrap">
+  <p class="kicker">Token Launch Radar</p>
+  <h1>What would it be worth if it launched?</h1>
+  <p class="lede">198 protocols that record no token, ranked by the implied value of the token they
+  would have if launched — from their own TVL, 7-day growth and age, priced off launched
+  protocols in the same category. Every row carries a concrete farm plan.</p>
+  <p class="meta" id="meta">Loading…</p>
+</header>
+
+<main class="wrap">
+  <section class="controls" aria-label="Filter and sort">
+    <label>Search <input id="q" type="search" placeholder="Name or slug…" autocomplete="off"></label>
+    <label>Category <select id="cat"></select></label>
+    <label>Chain <select id="chain"></select></label>
+    <label>Size <select id="size">
+      <option value="">Any TVL</option>
+      <option value="huge">≥ $1B</option>
+      <option value="big">$250M – $1B</option>
+      <option value="mid">$50M – $250M</option>
+      <option value="small">&lt; $50M</option>
+    </select></label>
+    <label>Confidence <select id="conf">
+      <option value="">Any</option><option value="2">High</option>
+      <option value="1">Medium</option><option value="0">Low</option>
+    </select></label>
+    <label>Sort <select id="sort">
+      <option value="rank">Rank (implied value)</option>
+      <option value="tvl">TVL</option>
+      <option value="growth">7-day growth</option>
+      <option value="age">Age</option>
+      <option value="name">Name</option>
+    </select></label>
+  </section>
+
+  <section id="detail" class="detail" hidden></section>
+
+  <p class="count" id="count"></p>
+  <div class="tablewrap">
+    <table id="board">
+      <thead><tr>
+        <th class="num">#</th><th>Protocol</th><th>Category</th><th>Chains</th>
+        <th class="num">TVL</th><th class="num">7-day</th><th class="num">Age</th>
+        <th class="num">Implied value</th><th>Confidence</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <p class="empty" id="empty" hidden>No protocol matches these filters. Clear the search or widen a filter.</p>
+</main>
+
+<footer class="wrap">
+  <h2>How the value is worked out</h2>
+  <p>Implied value = TVL × the median market-cap-to-TVL ratio of launched protocols in the
+  same category. Ratios are winsorized to the 5th/90th percentile of all launched ratios, then
+  shrunk toward the global median when a category has few launched peers, so one odd peer
+  cannot set a whole category. The result is adjusted by 7-day TVL growth (±30% growth moves
+  value by up to ±12%) and by age (a protocol that has run up to 4 years with no token gets
+  up to 8% more than a brand-new one). Low/high use the category’s 25th/75th percentile ratio.
+  Nothing is hardcoded by name: the ranking follows from the snapshot’s own figures.</p>
+  <p><strong>“Records no token” is not “has no token.”</strong> A protocol is on this board when
+  DefiLlama’s record carries no symbol, gecko id or market cap for it. It may still have a token
+  the record does not carry. Wrapped, staked and bridged products of tokens that already trade,
+  and exchanges, are left out. Gas costs in the farm plans are rough per-transaction estimates
+  for the chain, not quotes. This is research, not financial advice, and it never predicts
+  whether or when a token launches.</p>
+  <p class="src">Data: DefiLlama public protocols snapshot, fetched 2026-11-14. Board generated from
+  that snapshot alone; no live data. Pre-token watchlist: 40 protocols at or above $50M TVL.</p>
+</footer>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
